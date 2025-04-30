@@ -1,16 +1,25 @@
 <?php
-use local_participation_export\service\quiz_data_service;
-// ini_set('display_errors', 1);
-// error_reporting(E_ALL);
-defined('MOODLE_INTERNAL') || define('MOODLE_INTERNAL', true);
-require_once(__DIR__ . '/../../config.php');
-require_once($CFG->dirroot . '/local/participation_export/db/services.php');
+// Enable error display for debugging — disable in production
+ini_set('display_errors', 1);
+error_reporting(E_ALL);
+// define('CLI_SCRIPT', true);
+
+require_once(dirname(__DIR__, 2) . '\..\config.php');
+require_once(dirname(__DIR__, 1) . '\classes\services\quiz_data_services.php');
+
+/**
+ * Retrieves an access token from the external system using client credentials.
+ *
+ * @return array|null
+ * @throws Exception if required credentials are missing.
+ */
 function get_access_token() {
     global $CFG;
 
+
     // Check if the required configuration values are available
     if (empty($CFG->client_id) || empty($CFG->client_secret)) {
-        throw new Exception("Required configuration values are missing.");
+        throw new Exception("Missing OAuth credentials");
     }
 
     $client_id = $CFG->client_id;
@@ -29,7 +38,6 @@ function get_access_token() {
 
     // Initialize cURL session
     $ch = curl_init();
-
     // Set cURL options
     curl_setopt($ch, CURLOPT_URL, $token_url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -54,10 +62,9 @@ function get_access_token() {
     if ($response === false) {
         // Handle error
       
-        $info = curl_getinfo($ch);
-        echo "cURL Info:\n";
-        print_r($info);
-        exit();
+        error_log('Access token cURL error: ' . curl_error($ch));
+        curl_close($ch);
+        return null;
     }
 
     $response_data = json_decode($response, true);
@@ -78,28 +85,34 @@ function get_access_token() {
         echo "Error: Access token not received.\n";
         return null;
     }
+   
 }
+
+/**
+ * Fetches participation data from Moodle and validates it with the external system.
+ *
+ * @return array|null Returns the final prepared data array or null on failure.
+ */
 
 function get_student_data() {
     global $CFG;
 
     // Get the access token
     $token_data = get_access_token();
-   
+    $records = \local_participationexport\services\quiz_data_service::get_quiz_attempts();
     if (!$token_data || empty($token_data['access_token'])) {
-        echo "Failed to obtain access token.\n";
+        error_log("Failed to obtain access token.");
         return null;
     }
-
     $access_token = $token_data['access_token'];
     $api_url = $CFG->base_url . "Api/WS/v1/StudyPlanData/List";
-    $records = local_participation_export_services::get_quiz_attempts();
-
-    foreach($records as $data)
-
+    $final_data = [];
+    foreach ($records as $unitcode => $record) 
     {
-        $student_id = $record['stu_id'];
-          // Parameters for the API request
+        $student_id = $record->stu_id ?? null;
+        if (!$student_id) continue;
+        //$student_id = 100135726;  
+        // Parameters for the API request
         $params = [
             'pageSize' => 100,
             'page' => 1,
@@ -108,7 +121,7 @@ function get_student_data() {
          // Prepare the full API URL with query parameters
         $getStudentPackage = $api_url . '?' . http_build_query($params,'', '&');
         $ch = curl_init();
-
+   
         // Set cURL options for the API request
         curl_setopt($ch, CURLOPT_URL, $getStudentPackage);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -126,7 +139,7 @@ function get_student_data() {
         if ($response === false) {
             echo 'Curl error: ' . curl_error($ch);
             curl_close($ch);
-            return null;
+           continue;
         }
     
         // Close the cURL session
@@ -135,25 +148,131 @@ function get_student_data() {
         // Decode the JSON response
         $data = json_decode($response, true);
       
-        // Check if there was an error decoding the response
         if (json_last_error() !== JSON_ERROR_NONE) {
-            echo "JSON decode error: " . json_last_error_msg();
-            return null;
+            echo "JSON decode error: " . json_last_error_msg() . "\n";
+            continue;
         }
-    
+
+        if (!isset($data['DataSet']) || !is_array($data['DataSet'])) {
+            echo "No DataSet found in response for student ID $student_id\n";
+            continue;
+        }
+
+        // Filter only matching unitcode
+        $matched_units = array_filter($data['DataSet'], function ($unit) use ($unitcode) {
+            return isset($unit['spkStudyPackageCode']) && $unit['spkStudyPackageCode'] === $unitcode;
+        });
+
+            // Save only if matching units found
+            foreach ($matched_units as $unit) {
+                $api_student_id = $unit['stuStudentId'] ?? null;
+            
+                if ($student_id != $api_student_id) {
+                    echo "Mismatch: Local ID $student_id != API ID $api_student_id\n";
+                    continue;
+                }
+                $spk_ver_no = $unit['spkVersionNumber'] ?? '';
+                $ssp_att_no = $unit['sspAttendanceNumber'] ?? '';
+                $hours = $record->timetaken;
+                $timestamp = $record->timefinished;
+                $timestamp = is_numeric($record->timefinished) ? (int) $record->timefinished : strtotime($record->timefinished);
+                $iso_time = date('c', $timestamp);
+                $firstname = $record->first;
+                $lastname = $record->last;
+                $course = $record->course;
+                $shortname = $record->shortname;
+                $assignemnt = $record->assignment;
+                
+                $final_data[] = [
+                    'StudyPackageCode' => $unitcode,
+                    'Start' => $iso_time,
+                    'End' => $iso_time,
+                    'Hours' => $hours,
+                    'StudentId' => $student_id,
+                    'StudyPackageVersionNumber'=> 1,
+                    "StudentStudyPackageAttemptNumber"=> 1,
+                    "AttendanceStatus" => "H", 
+                    "SubType" => "220",
+                    "Type" => "PRT", 
+                    'firstname' => $firstname,
+                    "lastname" => $lastname,
+                    "course"=> $course,
+                    "shortname" => $shortname,
+                    "assignment" => $assignemnt,
+              
+                ];
+            }
+       
         // Return the student data
         
     }
   
-    return $data;
+    return $final_data;
  
    
 }
 
-try {
-    $student_data = get_student_data();
 
-} catch (Exception $e) {
-    echo "Error: " . $e->getMessage();
+function send_student_participation(){
+    global $CFG;
+
+    $participationData = get_student_data();
+    if (!$participationData) {
+        echo "❌ No participation data to send.\n";
+        return null;
+    }
+
+ 
+        $token_data = get_access_token();
+        if (!$token_data || empty($token_data['access_token'])) {
+            echo "Failed to obtain access token.\n";
+            return null;
+        }
+        $access_token = $token_data['access_token'];
+        $api_url = rtrim($CFG->base_url, '/') . "/Api/WS/v1/Engagements/Import";
+
+      
+        // Prepare the final data
+        $payload = json_encode(["Items" => $participationData], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        // Check for JSON encoding errors
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            echo "JSON encoding error: " . json_last_error_msg();
+            return;
+        }
+        $headers = [
+            'Authorization: Bearer ' . trim($access_token),
+            'Content-Type: application/json',
+            'Accept: application/json',
+           'Content-Length: ' . strlen($payload)
+        ];
+    
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $api_url,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false
+        ]);
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+
+        if ($response === false) {
+              error_log("❌ Curl error: $error");
+             return null;
+        } else {
+            // Output response for debugging
+            echo "Response: " . $response;
+            echo "HTTP Status Code: " . curl_getinfo($ch, CURLINFO_HTTP_CODE); // Output HTTP status code for better debugging
+        }
+
+        // Close the cURL session
+        curl_close($ch);
+        return $participationData;
+    
 }
-?>
+
