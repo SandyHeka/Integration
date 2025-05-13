@@ -107,6 +107,7 @@ function get_student_data() {
     $access_token = $token_data['access_token'];
     $api_url = $CFG->base_url . "Api/WS/v1/StudyPlanData/List";
     $final_data = [];
+    $missing_students = [];
     foreach ($records as $unitcode => $record) 
     {
         $student_id = $record->stu_id ?? null;
@@ -147,9 +148,21 @@ function get_student_data() {
     
         // Decode the JSON response
         $data = json_decode($response, true);
-      
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            echo "JSON decode error: " . json_last_error_msg() . "\n";
+        $units = $data['DataSet'] ?? [];
+
+        $matched_units = array_filter($units, function ($unit) use ($unitcode) {
+            return isset($unit['spkStudyPackageCode']) && $unit['spkStudyPackageCode'] === $unitcode;
+        });
+        if (empty($matched_units)) {
+            $missing_students[] = [
+                'StudentId' => $student_id,
+                'firstname' => $record->first,
+                'lastname' => $record->last,
+                'course' => $record->course,
+                'shortname' => $record->shortname,
+                'assignment' => $record->assignment,
+                'StudyPackageCode' => $unitcode
+            ];
             continue;
         }
 
@@ -163,51 +176,35 @@ function get_student_data() {
             return isset($unit['spkStudyPackageCode']) && $unit['spkStudyPackageCode'] === $unitcode;
         });
 
-            // Save only if matching units found
-            foreach ($matched_units as $unit) {
-                $api_student_id = $unit['stuStudentId'] ?? null;
-            
-                if ($student_id != $api_student_id) {
-                    echo "Mismatch: Local ID $student_id != API ID $api_student_id\n";
-                    continue;
-                }
-                $spk_ver_no = $unit['spkVersionNumber'] ?? '';
-                $ssp_att_no = $unit['sspAttendanceNumber'] ?? '';
-                $hours = $record->timetaken;
-                $timestamp = $record->timefinished;
-                $timestamp = is_numeric($record->timefinished) ? (int) $record->timefinished : strtotime($record->timefinished);
-                $iso_time = date('c', $timestamp);
-                $firstname = $record->first;
-                $lastname = $record->last;
-                $course = $record->course;
-                $shortname = $record->shortname;
-                $assignemnt = $record->assignment;
-                
-                $final_data[] = [
-                    'StudyPackageCode' => $unitcode,
-                    'Start' => $iso_time,
-                    'End' => $iso_time,
-                    'Hours' => $hours,
-                    'StudentId' => $student_id,
-                    'StudyPackageVersionNumber'=> 1,
-                    "StudentStudyPackageAttemptNumber"=> 1,
-                    "AttendanceStatus" => "H", 
-                    "SubType" => "220",
-                    "Type" => "PRT", 
-                    'firstname' => $firstname,
-                    "lastname" => $lastname,
-                    "course"=> $course,
-                    "shortname" => $shortname,
-                    "assignment" => $assignemnt,
-              
-                ];
-            }
-       
-        // Return the student data
-        
+        foreach ($matched_units as $unit) {
+            $timestamp = is_numeric($record->timefinished)
+                ? (int) $record->timefinished
+                : strtotime($record->timefinished);
+
+            $final_data[] = [
+                'StudyPackageCode' => $unitcode,
+                'Start' => date('c', $timestamp),
+                'End' => date('c', $timestamp),
+                'Hours' => $record->timetaken,
+                'StudentId' => $student_id,
+                'StudyPackageVersionNumber' => 1,
+                'StudentStudyPackageAttemptNumber' => 1,
+                'AttendanceStatus' => 'H',
+                'SubType' => '220',
+                'Type' => 'PRT',
+                'firstname' => $record->first,
+                'lastname' => $record->last,
+                'course' => $record->course,
+                'shortname' => $record->shortname,
+                'assignment' => $record->assignment
+            ];
+        }
     }
   
-    return $final_data;
+    return [
+        'matched' => $final_data,
+        'missing' => $missing_students
+    ];
  
    
 }
@@ -217,62 +214,62 @@ function send_student_participation(){
     global $CFG;
 
     $participationData = get_student_data();
-    if (!$participationData) {
+    if (!$participationData || empty($participationData['matched'])) {
         echo "❌ No participation data to send.\n";
         return null;
     }
 
- 
-        $token_data = get_access_token();
-        if (!$token_data || empty($token_data['access_token'])) {
-            echo "Failed to obtain access token.\n";
-            return null;
-        }
-        $access_token = $token_data['access_token'];
-        $api_url = rtrim($CFG->base_url, '/') . "/Api/WS/v1/Engagements/Import";
+    $matched = $participationData['matched'];
+    $token_data = get_access_token();
+    if (!$token_data || empty($token_data['access_token'])) {
+        echo "Failed to obtain access token.\n";
+        return null;
+    }
+    $access_token = $token_data['access_token'];
+    $api_url = rtrim($CFG->base_url, '/') . "/Api/WS/v1/Engagements/Import";
 
       
-        // Prepare the final data
-        $payload = json_encode(["Items" => $participationData], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        // Check for JSON encoding errors
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            echo "JSON encoding error: " . json_last_error_msg();
-            return;
-        }
-        $headers = [
-            'Authorization: Bearer ' . trim($access_token),
-            'Content-Type: application/json',
-            'Accept: application/json',
-           'Content-Length: ' . strlen($payload)
-        ];
+    // Prepare the final data
+    $payload = json_encode(["Items" => $participationData], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    // Check for JSON encoding errors
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        echo "JSON encoding error: " . json_last_error_msg();
+        return;
+    }
+    $headers = [
+        'Authorization: Bearer ' . trim($access_token),
+        'Content-Type: application/json',
+        'Accept: application/json',
+        'Content-Length: ' . strlen($payload)
+    ];
     
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $api_url,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => $payload,
-            CURLOPT_HTTPHEADER => $headers,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_SSL_VERIFYHOST => false
-        ]);
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curlError = curl_error($ch);
-        curl_close($ch);
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $api_url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $payload,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false
+    ]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
 
-        if ($response === false) {
-              error_log("❌ Curl error: $error");
-             return null;
-        } else {
-            // Output response for debugging
-            echo "Response: " . $response;
-            echo "HTTP Status Code: " . curl_getinfo($ch, CURLINFO_HTTP_CODE); // Output HTTP status code for better debugging
-        }
+    if ($response === false) {
+            error_log("❌ Curl error: $error");
+            return null;
+    } else {
+        // Output response for debugging
+        echo "Response: " . $response;
+        echo "HTTP Status Code: " . curl_getinfo($ch, CURLINFO_HTTP_CODE); // Output HTTP status code for better debugging
+    }
 
-        // Close the cURL session
-        curl_close($ch);
-        return $participationData;
+    // Close the cURL session
+    curl_close($ch);
+    return $participationData;
     
 }
 

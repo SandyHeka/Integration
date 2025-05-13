@@ -16,8 +16,8 @@ class quiz_data_service {
     public static function get_quiz_attempts() {
         global $DB;
  
-        $DateToday = "2025-03-29";
-        $DateTodayPlus1 =  date('Y-m-d', strtotime('+1 day'));
+        $DateToday ="2024-02-22";
+        $DateTodayPlus1 = "2024-02-23" ;
         // $dateToday = date('Y-m-d') "2024-02-22";
         // $dateTodayPlus1 = date('Y-m-d', strtotime('+1 day')) "2024-02-23";
 
